@@ -43,6 +43,7 @@ import org.apache.dubbo.rpc.cluster.directory.StaticDirectory;
 import org.apache.dubbo.rpc.cluster.support.ClusterUtils;
 import org.apache.dubbo.rpc.cluster.support.registry.ZoneAwareCluster;
 import org.apache.dubbo.rpc.model.ApplicationModel;
+import org.apache.dubbo.rpc.model.AsyncMethodInfo;
 import org.apache.dubbo.rpc.model.ConsumerModel;
 import org.apache.dubbo.rpc.model.ServiceDescriptor;
 import org.apache.dubbo.rpc.model.ServiceRepository;
@@ -68,6 +69,7 @@ import static org.apache.dubbo.common.constants.CommonConstants.METADATA_KEY;
 import static org.apache.dubbo.common.constants.CommonConstants.METHODS_KEY;
 import static org.apache.dubbo.common.constants.CommonConstants.MONITOR_KEY;
 import static org.apache.dubbo.common.constants.CommonConstants.PROXY_CLASS_REF;
+import static org.apache.dubbo.common.constants.CommonConstants.REMOTE_METADATA_STORAGE_TYPE;
 import static org.apache.dubbo.common.constants.CommonConstants.REVISION_KEY;
 import static org.apache.dubbo.common.constants.CommonConstants.SEMICOLON_SPLIT_PATTERN;
 import static org.apache.dubbo.common.constants.CommonConstants.SIDE_KEY;
@@ -134,13 +136,18 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
      */
     private transient volatile boolean destroyed;
 
+    private final ServiceRepository repository;
+
     private DubboBootstrap bootstrap;
 
     public ReferenceConfig() {
+        super();
+        this.repository = ApplicationModel.getServiceRepository();
     }
 
     public ReferenceConfig(Reference reference) {
         super(reference);
+        this.repository = ApplicationModel.getServiceRepository();
     }
 
     public synchronized T get() {
@@ -185,15 +192,6 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
 
         checkAndUpdateSubConfigs();
 
-        //init serivceMetadata
-        serviceMetadata.setVersion(version);
-        serviceMetadata.setGroup(group);
-        serviceMetadata.setDefaultGroup(group);
-        serviceMetadata.setServiceType(getActualInterface());
-        serviceMetadata.setServiceInterfaceName(interfaceName);
-        // TODO, uncomment this line once service key is unified
-        serviceMetadata.setServiceKey(URL.buildKey(interfaceName, group, version));
-
         checkStubAndLocal(interfaceClass);
         ConfigValidationUtils.checkMock(interfaceClass, this);
 
@@ -223,7 +221,11 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         // appendParameters(map, consumer, Constants.DEFAULT_KEY);
         AbstractConfig.appendParameters(map, consumer);
         AbstractConfig.appendParameters(map, this);
-        Map<String, Object> attributes = null;
+        MetadataReportConfig metadataReportConfig = getMetadataReportConfig();
+        if (metadataReportConfig != null && metadataReportConfig.isValid()) {
+            map.putIfAbsent(METADATA_KEY, REMOTE_METADATA_STORAGE_TYPE);
+        }
+        Map<String, AsyncMethodInfo> attributes = null;
         if (CollectionUtils.isNotEmpty(getMethods())) {
             attributes = new HashMap<>();
             for (MethodConfig methodConfig : getMethods()) {
@@ -235,7 +237,7 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                         map.put(methodConfig.getName() + ".retries", "0");
                     }
                 }
-                ConsumerModel.AsyncMethodInfo asyncMethodInfo = AbstractConfig.convertMethodConfig2AsyncInfo(methodConfig);
+                AsyncMethodInfo asyncMethodInfo = AbstractConfig.convertMethodConfig2AsyncInfo(methodConfig);
                 if (asyncMethodInfo != null) {
 //                    consumerModel.getMethodModel(methodConfig.getName()).addAttribute(ASYNC_KEY, asyncMethodInfo);
                     attributes.put(methodConfig.getName(), asyncMethodInfo);
@@ -253,21 +255,13 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
 
         serviceMetadata.getAttachments().putAll(map);
 
-        ServiceRepository repository = ApplicationModel.getServiceRepository();
-        ServiceDescriptor serviceDescriptor = repository.registerService(interfaceClass);
-        repository.registerConsumer(
-                serviceMetadata.getServiceKey(),
-                attributes,
-                serviceDescriptor,
-                this,
-                null,
-                serviceMetadata);
-
         ref = createProxy(map);
 
         serviceMetadata.setTarget(ref);
         serviceMetadata.addAttribute(PROXY_CLASS_REF, ref);
-        repository.lookupReferredService(serviceMetadata.getServiceKey()).setProxyObject(ref);
+        ConsumerModel consumerModel = repository.lookupReferredService(serviceMetadata.getServiceKey());
+        consumerModel.setProxyObject(ref);
+        consumerModel.init(attributes);
 
         initialized = true;
 
@@ -333,16 +327,20 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                 }
                 if (registryURL != null) { // registry url is available
                     // for multi-subscription scenario, use 'zone-aware' policy by default
-                    URL u = registryURL.addParameterIfAbsent(CLUSTER_KEY, ZoneAwareCluster.NAME);
-                    // The invoker wrap relation would be like: ZoneAwareClusterInvoker(StaticDirectory) -> FailoverClusterInvoker(RegistryDirectory, routing happens here) -> Invoker
-                    invoker = CLUSTER.join(new StaticDirectory(u, invokers));
+                    String cluster = registryURL.getParameter(CLUSTER_KEY, ZoneAwareCluster.NAME);
+                    // The invoker wrap sequence would be: ZoneAwareClusterInvoker(StaticDirectory) -> FailoverClusterInvoker(RegistryDirectory, routing happens here) -> Invoker
+                    invoker = Cluster.getCluster(cluster, false).join(new StaticDirectory(registryURL, invokers));
                 } else { // not a registry url, must be direct invoke.
-                    invoker = CLUSTER.join(new StaticDirectory(invokers));
+                    String cluster = CollectionUtils.isNotEmpty(invokers)
+                            ? (invokers.get(0).getUrl() != null ? invokers.get(0).getUrl().getParameter(CLUSTER_KEY, ZoneAwareCluster.NAME) : Cluster.DEFAULT)
+                            : Cluster.DEFAULT;
+                    invoker = Cluster.getCluster(cluster).join(new StaticDirectory(invokers));
                 }
             }
         }
 
         if (shouldCheck() && !invoker.isAvailable()) {
+            invoker.destroy();
             throw new IllegalStateException("Failed to check the status of the service "
                     + interfaceName
                     + ". No provider available for the service "
@@ -368,7 +366,7 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             metadataService.publishServiceDefinition(consumerURL);
         }
         // create service proxy
-        return (T) PROXY_FACTORY.getProxy(invoker);
+        return (T) PROXY_FACTORY.getProxy(invoker, ProtocolUtils.isGeneric(generic));
     }
 
     /**
@@ -379,7 +377,12 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         if (StringUtils.isEmpty(interfaceName)) {
             throw new IllegalStateException("<dubbo:reference interface=\"\" /> interface not allow null!");
         }
-        completeCompoundConfigs();
+        completeCompoundConfigs(consumer);
+        if (consumer != null) {
+            if (StringUtils.isEmpty(registryIds)) {
+                setRegistryIds(consumer.getRegistryIds());
+            }
+        }
         // get consumer's global configuration
         checkDefault();
         this.refresh();
@@ -397,9 +400,28 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             }
             checkInterfaceAndMethods(interfaceClass, getMethods());
         }
+
+        //init serivceMetadata
+        serviceMetadata.setVersion(getVersion());
+        serviceMetadata.setGroup(getGroup());
+        serviceMetadata.setDefaultGroup(getGroup());
+        serviceMetadata.setServiceType(getActualInterface());
+        serviceMetadata.setServiceInterfaceName(interfaceName);
+        // TODO, uncomment this line once service key is unified
+        serviceMetadata.setServiceKey(URL.buildKey(interfaceName, group, version));
+
+        ServiceRepository repository = ApplicationModel.getServiceRepository();
+        ServiceDescriptor serviceDescriptor = repository.registerService(interfaceClass);
+        repository.registerConsumer(
+                serviceMetadata.getServiceKey(),
+                serviceDescriptor,
+                this,
+                null,
+                serviceMetadata);
+
         resolveFile();
         ConfigValidationUtils.validateReferenceConfig(this);
-        appendParameters();
+        postProcessConfig();
     }
 
 
@@ -446,30 +468,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         this.bootstrap = bootstrap;
     }
 
-    @SuppressWarnings("unused")
-    private final Object finalizerGuardian = new Object() {
-        @Override
-        protected void finalize() throws Throwable {
-            super.finalize();
-
-            if (!ReferenceConfig.this.destroyed) {
-                logger.warn("ReferenceConfig(" + url + ") is not DESTROYED when FINALIZE");
-
-                /* don't destroy for now
-                try {
-                    ReferenceConfig.this.destroy();
-                } catch (Throwable t) {
-                        logger.warn("Unexpected err when destroy invoker of ReferenceConfig(" + url + ") in finalize method!", t);
-                }
-                */
-            }
-        }
-    };
-
-    public void appendParameters() {
-        URL appendParametersUrl = URL.valueOf("appendParameters://");
-        List<AppendParametersComponent> appendParametersComponents = ExtensionLoader.getExtensionLoader(AppendParametersComponent.class).getActivateExtension(appendParametersUrl, (String[]) null);
-        appendParametersComponents.forEach(component -> component.appendReferParameters(this));
+    private void postProcessConfig() {
+        List<ConfigPostProcessor> configPostProcessors =ExtensionLoader.getExtensionLoader(ConfigPostProcessor.class)
+                .getActivateExtension(URL.valueOf("configPostProcessor://"), (String[]) null);
+        configPostProcessors.forEach(component -> component.postProcessReferConfig(this));
     }
 
     // just for test

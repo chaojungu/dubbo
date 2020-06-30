@@ -71,7 +71,7 @@ public class ConsulDynamicConfigurationTest {
         assertEquals("bar", configuration.getConfig("foo", "dubbo"));
         // test does not block
         assertEquals("bar", configuration.getConfig("foo", "dubbo"));
-        Assertions.assertThrows(IllegalArgumentException.class, () -> configuration.getConfig("not-exist", "dubbo"));
+        Assertions.assertNull(configuration.getConfig("not-exist", "dubbo"));
     }
 
     @Test
@@ -100,6 +100,12 @@ public class ConsulDynamicConfigurationTest {
         System.out.println(kvClient.getKeys("/dubbo/config/dubbo/foo"));
         System.out.println(kvClient.getKeys("/dubbo/config"));
         System.out.println(kvClient.getValues("/dubbo/config/dubbo/foo"));
+    }
+
+    @Test
+    public void testPublishConfig() {
+        configuration.publishConfig("foo", "value1");
+        Assertions.assertEquals("value1", configuration.getString("/dubbo/config/dubbo/foo"));
     }
 
     @Test

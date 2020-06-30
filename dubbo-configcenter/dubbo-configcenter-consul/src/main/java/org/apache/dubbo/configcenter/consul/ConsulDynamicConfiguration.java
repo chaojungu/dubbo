@@ -145,13 +145,13 @@ public class ConsulDynamicConfiguration implements DynamicConfiguration {
 //        }
 //        return true;
         String normalizedKey = convertKey(group, key);
-        return kvClient.putValue(normalizedKey + PATH_SEPARATOR + content);
+        return kvClient.putValue(normalizedKey, content);
     }
 
     @Override
     public Object getInternalProperty(String key) {
         logger.info("getting config from: " + key);
-        return kvClient.getValueAsString(key, Charsets.UTF_8).orElseThrow(() -> new IllegalArgumentException(key + " does not exit."));
+        return kvClient.getValueAsString(key, Charsets.UTF_8).orElse(null);
     }
 
     @Override
